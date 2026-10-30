@@ -1,8 +1,21 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import * as net from 'node:net';
 import { connectWire, Client } from '../src/index.js';
 
-describe('AnchorWire Live Integration (against real AnchorDB server)', () => {
+async function isPortOpen(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = net.connect(port, host, () => {
+      s.destroy();
+      resolve(true);
+    });
+    s.on('error', () => resolve(false));
+  });
+}
+
+const liveRunning = await isPortOpen('127.0.0.1', 7448);
+
+describe('AnchorWire Live Integration (against real AnchorDB server)', { skip: !liveRunning }, () => {
   let client: Client;
 
   before(async () => {
@@ -54,8 +67,8 @@ describe('AnchorWire Live Integration (against real AnchorDB server)', () => {
       { name: 'batch_node_3', props: { metric: 30.0 } },
     ];
 
-    const savedCount = await client.saveBatch(items);
-    assert.equal(savedCount, 3);
+    const savedNames = await client.saveBatch(items);
+    assert.equal(savedNames.length, 3);
 
     const listResult = await client.list({ limit: 10 });
     assert.ok(listResult.totalCount >= 4); // server_alpha + 3 batch nodes

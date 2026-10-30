@@ -1,4 +1,14 @@
-import { OpCode, Flags, OpStatus, OrderByMode } from './constants.js';
+import {
+  OpCode,
+  Flags,
+  OpStatus,
+  OrderByMode,
+  OrderByModeType,
+  AuthType,
+  StructuredRespMagic,
+  SubCodeRotationStaged,
+  MemoryStatus,
+} from './constants.js';
 import { WireConnection } from './connection.js';
 import {
   encodeSavePayload,
@@ -24,11 +34,17 @@ import {
   decodePartitionCatalogResponse,
   encodePartitionInspectRequest,
   decodePartitionInspectResponse,
+  encodeStructuredAuth,
+  decodeAuthResponse,
+  decodeRotationStagedResponse,
+  encodeMemoryNegotiationRequest,
+  decodeMemoryNegotiationResponse,
   decodeOKPayload,
   decodeErrorPayload,
 } from './protocol.js';
 import {
   RecordItem,
+  ModelSchema,
   EntityResult,
   ListQueryOptions,
   ListResult,
@@ -37,6 +53,7 @@ import {
   GraphQueryResult,
   GraphResponse,
   GraphChainOptions,
+  MathOperator,
   MathResponse,
   PartitionCatalogItem,
   PartitionInspectRequest,
@@ -45,7 +62,10 @@ import {
   Roles,
   ComputeOp,
   WireClientOptions,
+  AuthRequest,
+  MemoryNegotiationResponse,
 } from './types.js';
+import { GetBuilder, ListBuilder, UpdateBuilder, GraphBuilder, MathEngine } from './builders.js';
 
 export class Client {
   private conn: WireConnection;
@@ -80,6 +100,20 @@ export class Client {
   }
 
   /**
+   * Reports true if the client communicates over the network with an AnchorDB engine.
+   */
+  public isRemote(): boolean {
+    return true;
+  }
+
+  /**
+   * Reports true if the client wraps an embedded local AnchorDB file.
+   */
+  public isLocal(): boolean {
+    return false;
+  }
+
+  /**
    * Creates a scoped client view bound to the given model name.
    * Each operation on the returned client ensures the target model is selected before execution.
    */
@@ -97,6 +131,115 @@ export class Client {
     this.currentModel = name;
     await this.conn.setModel(name);
     return this;
+  }
+
+  /**
+   * Performs structured handshake authentication with the server.
+   */
+  public async authStructured(req: AuthRequest): Promise<string> {
+    const payload = encodeStructuredAuth(req);
+    const resp = await this.conn.request(OpCode.Auth, payload);
+    if (resp.opCode === OpCode.ResponseError) {
+      const err = decodeErrorPayload(resp.payload);
+      throw new Error(`AuthStructured failed (${err.code}): ${err.message}`);
+    }
+    if (resp.payload.length > 0 && resp.payload[0] === StructuredRespMagic) {
+      if (resp.payload.length > 1 && resp.payload[1] === SubCodeRotationStaged) {
+        const { message } = decodeRotationStagedResponse(resp.payload);
+        return message;
+      }
+      return decodeAuthResponse(resp.payload);
+    }
+    return '';
+  }
+
+  /**
+   * Performs node pairing during an open pairing window.
+   */
+  public async authPairing(nodeID: string, commitment?: Uint8Array | Buffer): Promise<string> {
+    return this.authStructured({
+      type: AuthType.Pairing,
+      nodeID,
+      initialCommitment: commitment,
+      hasCommitment: !!commitment,
+    });
+  }
+
+  /**
+   * Performs ephemeral One-Time Key (OTK) join handshake.
+   */
+  public async authOTK(nodeID: string, otk: string, commitment?: Uint8Array | Buffer): Promise<string> {
+    return this.authStructured({
+      type: AuthType.OTK,
+      nodeID,
+      credential: otk,
+      initialCommitment: commitment,
+      hasCommitment: !!commitment,
+    });
+  }
+
+  /**
+   * Authenticates using an established HMAC session ticket.
+   */
+  public async authSession(nodeID: string, sessionKey: string): Promise<void> {
+    await this.authStructured({
+      type: AuthType.Session,
+      nodeID,
+      credential: sessionKey,
+    });
+  }
+
+  /**
+   * Performs Staged Preimage Commitment Rotation re-handshake.
+   */
+  public async authStagedReauth(
+    nodeID: string,
+    validator: Uint8Array | Buffer,
+    nextCommitment: Uint8Array | Buffer,
+  ): Promise<string> {
+    return this.authStructured({
+      type: AuthType.StagedReauth,
+      nodeID,
+      validator,
+      nextCommitment,
+    });
+  }
+
+  /**
+   * Negotiates memory budget and ingestion pacing parameters with AnchorWire.
+   */
+  public async negotiateMemory(
+    targetRecords: number,
+    estimatedRecordSizeBytes = 512,
+    preferredBatchSize = 1000,
+  ): Promise<MemoryNegotiationResponse> {
+    const payload = encodeMemoryNegotiationRequest({
+      targetRecords,
+      estimatedRecordSizeBytes,
+      clientBatchSize: preferredBatchSize,
+    });
+    const resp = await this.conn.request(OpCode.NegotiateMemory, payload);
+    if (resp.opCode === OpCode.ResponseError) {
+      const err = decodeErrorPayload(resp.payload);
+      throw new Error(`NegotiateMemory failed (${err.code}): ${err.message}`);
+    }
+    const nego = decodeMemoryNegotiationResponse(resp.payload);
+    this.conn.setNegotiation(nego);
+    return nego;
+  }
+
+  /**
+   * Enables or disables adaptive batch pacing.
+   */
+  public enableAdaptivePacing(enabled: boolean): void {
+    this.conn.enableAdaptivePacing(enabled);
+  }
+
+  /**
+   * Returns the currently active memory negotiation parameters.
+   */
+  public getNegotiation(): MemoryNegotiationResponse | null {
+    return this.conn.getNegotiation();
   }
 
   /**
@@ -131,30 +274,115 @@ export class Client {
     };
 
     const payload = encodeSavePayload(item);
-    const resp = await this.conn.request(OpCode.Save, payload, Flags.None, this.currentModel);
+    let lastError: Error | null = null;
 
-    if (resp.opCode === OpCode.ResponseError) {
-      const err = decodeErrorPayload(resp.payload);
-      throw new Error(`Save failed (${err.code}): ${err.message}`);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const resp = await this.conn.request(OpCode.Save, payload, Flags.None, this.currentModel);
+        if (resp.opCode === OpCode.ResponseError) {
+          const err = decodeErrorPayload(resp.payload);
+          const errMsg = `Save failed (${err.code}): ${err.message}`;
+          if (err.code === 507 || err.message.toLowerCase().includes('backpressure')) {
+            lastError = new Error(errMsg);
+            await new Promise((r) => setTimeout(r, 15 * (attempt + 1)));
+            continue;
+          }
+          throw new Error(errMsg);
+        }
+        return decodeOKPayload(resp.payload);
+      } catch (e) {
+        const msg = String(e);
+        if (msg.includes('507') || msg.toLowerCase().includes('backpressure')) {
+          lastError = e instanceof Error ? e : new Error(msg);
+          await new Promise((r) => setTimeout(r, 15 * (attempt + 1)));
+          continue;
+        }
+        throw e;
+      }
     }
-
-    return decodeOKPayload(resp.payload);
+    throw lastError ?? new Error('Save failed after retries');
   }
 
   /**
-   * Ingests multiple entity records in a single transactional batch.
+   * Registers a concept node with 2D spatial coordinate and 4D semantic role vector.
    */
-  public async saveBatch(items: RecordItem[]): Promise<number> {
-    const payload = encodeSaveBatchPayload(items);
-    const resp = await this.conn.request(OpCode.SaveBatch, payload, Flags.None, this.currentModel);
+  public async appendNode(word: string, coord: Point2D, roles: Roles): Promise<string> {
+    return this.save(word, {}, { coord, roles });
+  }
 
-    if (resp.opCode === OpCode.ResponseError) {
-      const err = decodeErrorPayload(resp.payload);
-      throw new Error(`SaveBatch failed (${err.code}): ${err.message}`);
+  /**
+   * Stores an entity with an automatically generated identifier.
+   */
+  public async saveAutoID(props: Record<string, number>): Promise<string> {
+    return this.save('', props);
+  }
+
+  /**
+   * Stores an entity with raw numeric properties, returning the effective name identifier.
+   */
+  public async saveWithID(name: string, props: Record<string, number>): Promise<string> {
+    return this.save(name, props);
+  }
+
+  /**
+   * Ingests multiple entity records in a single transactional batch, automatically pacing if enabled.
+   * Returns the array of saved record names (matching Go SaveBatch).
+   */
+  public async saveBatch(items: RecordItem[]): Promise<string[]> {
+    if (items.length === 0) return [];
+
+    const pacing = this.conn.isPacingEnabled();
+    const nego = this.conn.getNegotiation();
+
+    if (pacing && nego && nego.status === MemoryStatus.Hold) {
+      const batchSize = Math.max(nego.allocatedBatchSize, 100);
+      if (items.length > batchSize) {
+        const allNames: string[] = [];
+        for (let i = 0; i < items.length; i += batchSize) {
+          const chunk = items.slice(i, i + batchSize);
+          const chunkNames = await this.sendSaveBatchChunk(chunk);
+          allNames.push(...chunkNames);
+          if (nego.releaseIntervalMs > 0 && i + batchSize < items.length) {
+            await new Promise((r) => setTimeout(r, nego.releaseIntervalMs));
+          }
+        }
+        return allNames;
+      }
     }
 
-    const countStr = decodeOKPayload(resp.payload);
-    return parseInt(countStr, 10) || items.length;
+    return this.sendSaveBatchChunk(items);
+  }
+
+  private async sendSaveBatchChunk(items: RecordItem[]): Promise<string[]> {
+    const payload = encodeSaveBatchPayload(items);
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const resp = await this.conn.request(OpCode.SaveBatch, payload, Flags.None, this.currentModel);
+        if (resp.opCode === OpCode.ResponseError) {
+          const err = decodeErrorPayload(resp.payload);
+          const errMsg = `SaveBatch failed (${err.code}): ${err.message}`;
+          if (err.code === 507 || err.message.toLowerCase().includes('backpressure')) {
+            lastError = new Error(errMsg);
+            await new Promise((r) => setTimeout(r, 20 * (attempt + 1)));
+            continue;
+          }
+          throw new Error(errMsg);
+        }
+        decodeOKPayload(resp.payload);
+        return items.map((r) => r.name);
+      } catch (e) {
+        const msg = String(e);
+        if (msg.includes('507') || msg.toLowerCase().includes('backpressure')) {
+          lastError = e instanceof Error ? e : new Error(msg);
+          await new Promise((r) => setTimeout(r, 20 * (attempt + 1)));
+          continue;
+        }
+        throw e;
+      }
+    }
+    throw lastError ?? new Error('SaveBatch failed after retries');
   }
 
   /**
@@ -253,10 +481,26 @@ export class Client {
   }
 
   /**
-   * Executes causal chain query from multiple seed nodes along a relation.
+   * Executes causal chain query from multiple seed nodes along a single relation or sequence of relations.
    */
-  public async causalChain(seeds: string[], relation: string, limitK = 10): Promise<CausalResult[]> {
-    const payload = encodeCausalPayload(seeds, relation, limitK);
+  public async causalChain(
+    seeds: string[],
+    relations: string | string[],
+    limitK = 10,
+  ): Promise<CausalResult[]> {
+    if (Array.isArray(relations)) {
+      if (relations.length === 0) return [];
+      let currentSeeds = [...seeds];
+      let currentResults: CausalResult[] = [];
+      for (const rel of relations) {
+        currentResults = await this.causalChain(currentSeeds, rel, limitK);
+        if (currentResults.length === 0) break;
+        currentSeeds = currentResults.map((r) => r.word);
+      }
+      return currentResults;
+    }
+
+    const payload = encodeCausalPayload(seeds, relations, limitK);
     const resp = await this.conn.request(OpCode.Causal, payload, Flags.None, this.currentModel);
 
     if (resp.opCode === OpCode.ResponseError) {
@@ -274,7 +518,7 @@ export class Client {
     inputs: string[],
     relation: string,
     limitK = 10,
-    orderMode: number = OrderByMode.Score,
+    orderMode: OrderByModeType | number = OrderByMode.Composite,
     beamWidth = 0.5,
   ): Promise<GraphResponse> {
     const payload = encodeGraphRequest(inputs, relation, limitK, orderMode, beamWidth);
@@ -304,9 +548,11 @@ export class Client {
   }
 
   /**
-   * Registers a fixed schema definition JSON string on the active model.
+   * Registers and locks a schema contract on the active model.
+   * Accepts either a ModelSchema object (e.g. `{ amount: 'float', discount: 'float?' }`) or a raw JSON string.
    */
-  public async attachSchema(schemaJSON: string): Promise<void> {
+  public async attachSchema(schema: ModelSchema | string): Promise<void> {
+    const schemaJSON = typeof schema === 'string' ? schema : JSON.stringify(schema);
     const payload = encodeAttachSchemaPayload(schemaJSON);
     const resp = await this.conn.request(OpCode.AttachSchema, payload, Flags.None, this.currentModel);
 
@@ -314,6 +560,22 @@ export class Client {
       const err = decodeErrorPayload(resp.payload);
       throw new Error(`AttachSchema failed (${err.code}): ${err.message}`);
     }
+  }
+
+  /**
+   * Locks the specified schema contract into the currently active model (alias matching Go driver.Attach).
+   */
+  public async attach(schema: ModelSchema | string): Promise<void> {
+    return this.attachSchema(schema);
+  }
+
+  /**
+   * Returns a scoped client view targeting the specified model and attaches the schema immediately (matching Go driver.AttachModel).
+   */
+  public async attachModel(modelName: string, schema: ModelSchema | string): Promise<Client> {
+    const cl = this.model(modelName);
+    await cl.attach(schema);
+    return cl;
   }
 
   /**
@@ -334,7 +596,7 @@ export class Client {
    * Executes in-storage geometric and statistical calculations.
    */
   public async math(
-    op: 'distance' | 'centroid' | 'cosine_similarity' | 'nearest',
+    op: MathOperator,
     words: string[],
     limitK = 10,
   ): Promise<MathResponse> {
@@ -378,7 +640,7 @@ export class Client {
    * Retrieves registered cold storage partition archives for a model (or all models if omitted).
    */
   public async partitionCatalog(model?: string): Promise<PartitionCatalogItem[]> {
-    const payload = encodePartitionCatalogRequest(model ?? this.currentModel);
+    const payload = encodePartitionCatalogRequest(model ?? '');
     const resp = await this.conn.request(OpCode.PartitionCatalog, payload, Flags.None, this.currentModel);
 
     if (resp.opCode === OpCode.ResponseError) {
@@ -402,6 +664,87 @@ export class Client {
     }
 
     return decodePartitionInspectResponse(resp.payload);
+  }
+
+  /**
+   * Queries the engine to retrieve metadata on archived partition files (alias matching Go driver.ListPartitions).
+   */
+  public async listPartitions(model?: string): Promise<PartitionCatalogItem[]> {
+    return this.partitionCatalog(model);
+  }
+
+  /**
+   * Inspects an archived partition file over AnchorWire (alias matching Go driver.InspectPartition).
+   */
+  public async inspectPartition(
+    partitionFile: string,
+    recordName?: string,
+    limit?: number,
+  ): Promise<PartitionInspectResponse> {
+    return this.partitionInspect({
+      partition_file: partitionFile,
+      record_name: recordName,
+      limit,
+    });
+  }
+
+  /**
+   * Retrieves a single record from an archived partition file through the engine (matching Go driver.InspectPartitionRecord).
+   */
+  public async inspectPartitionRecord(
+    partitionFile: string,
+    recordName: string,
+  ): Promise<EntityResult | null> {
+    const res = await this.partitionInspect({
+      partition_file: partitionFile,
+      record_name: recordName,
+      limit: 1,
+    });
+    if (res.props && Object.keys(res.props).length > 0) {
+      return new EntityResult(recordName, OpStatus.Active, res.props);
+    }
+    if (res.records && res.records.length > 0) {
+      const found = res.records.find((r) => r.name === recordName) ?? res.records[0];
+      return new EntityResult(found.name, OpStatus.Active, found.props);
+    }
+    return null;
+  }
+
+  // --- Fluent Query Builders ---
+
+  /**
+   * Returns a fluent query builder to retrieve an entity and optionally project/compute derived fields.
+   */
+  public getBuilder(name: string): GetBuilder {
+    return new GetBuilder(this, name);
+  }
+
+  /**
+   * Returns a fluent query builder to list, filter, compute, and paginate multiple entities.
+   */
+  public listBuilder(): ListBuilder {
+    return new ListBuilder(this);
+  }
+
+  /**
+   * Returns a fluent query builder to perform atomic batch updates and arithmetic mutations.
+   */
+  public updateBuilder(): UpdateBuilder {
+    return new UpdateBuilder(this);
+  }
+
+  /**
+   * Returns a fluent query builder for spatial ray casting, role alignment, and multi-hop reasoning.
+   */
+  public graphBuilder(): GraphBuilder {
+    return new GraphBuilder(this);
+  }
+
+  /**
+   * Returns a direct mathematical and geometric operations engine on the graph.
+   */
+  public mathEngine(): MathEngine {
+    return new MathEngine(this);
   }
 }
 
@@ -446,5 +789,10 @@ export async function connectWire(urlOrOptions: string | WireClientOptions = {})
 
   const client = new Client(opts);
   await client.connect();
+
+  if (opts.schema) {
+    await client.attachSchema(opts.schema);
+  }
+
   return client;
 }

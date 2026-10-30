@@ -5,6 +5,10 @@ import {
   MAX_PAYLOAD_SIZE,
   Flags,
   OpStatus,
+  StructuredAuthMagic,
+  StructuredRespMagic,
+  SubCodeRotationStaged,
+  AuthType,
 } from './constants.js';
 import { crc32IEEE } from './crc.js';
 import {
@@ -26,7 +30,11 @@ import {
   PartitionInspectResponse,
   Point2D,
   Roles,
+  AuthRequest,
+  MemoryNegotiationRequest,
+  MemoryNegotiationResponse,
 } from './types.js';
+import { parseDate } from './date.js';
 
 // --- BUFFER UTILITIES --------------------------------------------------------
 
@@ -150,6 +158,278 @@ export function encodeAuthPayload(token: string): Buffer {
   const chunks: Buffer[] = [];
   appendString(chunks, token);
   return Buffer.concat(chunks);
+}
+
+/**
+ * Encodes a structured authentication request for OpCode.Auth (gateway/connector handshake).
+ */
+export function encodeStructuredAuth(req: AuthRequest): Buffer {
+  const nodeIDBytes = Buffer.from(req.nodeID, 'utf-8');
+  const nodeIDLen = Math.min(nodeIDBytes.length, 0xffff);
+
+  if (req.type === AuthType.StagedReauth) {
+    const totalLen = 1 + 1 + 2 + nodeIDLen + 2 + 32 + 2 + 32;
+    const buf = Buffer.alloc(totalLen);
+    buf[0] = StructuredAuthMagic;
+    buf[1] = AuthType.StagedReauth;
+
+    let offset = 2;
+    buf.writeUInt16LE(nodeIDLen, offset);
+    offset += 2;
+    nodeIDBytes.copy(buf, offset, 0, nodeIDLen);
+    offset += nodeIDLen;
+
+    buf.writeUInt16LE(32, offset);
+    offset += 2;
+    if (req.validator) {
+      Buffer.from(req.validator).copy(buf, offset, 0, 32);
+    }
+    offset += 32;
+
+    buf.writeUInt16LE(32, offset);
+    offset += 2;
+    if (req.nextCommitment) {
+      Buffer.from(req.nextCommitment).copy(buf, offset, 0, 32);
+    }
+    return buf;
+  }
+
+  const credBytes = req.credential ? Buffer.from(req.credential, 'utf-8') : Buffer.alloc(0);
+  const credLen = Math.min(credBytes.length, 0xffff);
+
+  let totalLen = 1 + 1 + 2 + nodeIDLen + 2 + credLen;
+  if (req.hasCommitment || req.initialCommitment) {
+    totalLen += 2 + 32;
+  }
+  const buf = Buffer.alloc(totalLen);
+
+  buf[0] = StructuredAuthMagic;
+  buf[1] = req.type;
+
+  let offset = 2;
+  buf.writeUInt16LE(nodeIDLen, offset);
+  offset += 2;
+  nodeIDBytes.copy(buf, offset, 0, nodeIDLen);
+  offset += nodeIDLen;
+
+  buf.writeUInt16LE(credLen, offset);
+  offset += 2;
+  credBytes.copy(buf, offset, 0, credLen);
+  offset += credLen;
+
+  if (req.hasCommitment || req.initialCommitment) {
+    buf.writeUInt16LE(32, offset);
+    offset += 2;
+    if (req.initialCommitment) {
+      Buffer.from(req.initialCommitment).copy(buf, offset, 0, 32);
+    }
+  }
+
+  return buf;
+}
+
+/**
+ * Decodes an AuthRequest from a binary payload, falling back to legacy static token if magic is absent.
+ */
+export function decodeStructuredAuth(payload: Buffer): AuthRequest {
+  if (payload.length === 0) {
+    throw new Error('Malformed structured auth request payload: empty');
+  }
+
+  if (payload[0] !== StructuredAuthMagic) {
+    const { value: credential } = readString(payload, 0);
+    return {
+      type: AuthType.Static,
+      nodeID: '',
+      credential,
+    };
+  }
+
+  if (payload.length < 6) {
+    throw new Error('Malformed structured auth request payload: too short');
+  }
+
+  const authType = payload[1];
+  let offset = 2;
+
+  const nodeIDLen = payload.readUInt16LE(offset);
+  offset += 2;
+  if (payload.length < offset + nodeIDLen) {
+    throw new Error('Malformed structured auth request: truncated nodeID');
+  }
+  const nodeID = payload.toString('utf-8', offset, offset + nodeIDLen);
+  offset += nodeIDLen;
+
+  if (authType === AuthType.StagedReauth) {
+    if (payload.length < offset + 4 + 64) {
+      throw new Error('Malformed structured auth request: truncated staged reauth');
+    }
+    const valLen = payload.readUInt16LE(offset);
+    offset += 2;
+    if (valLen !== 32 || payload.length < offset + 32 + 2 + 32) {
+      throw new Error('Malformed structured auth request: invalid validator length');
+    }
+    const validator = Buffer.from(payload.subarray(offset, offset + 32));
+    offset += 32;
+
+    const nextLen = payload.readUInt16LE(offset);
+    offset += 2;
+    if (nextLen !== 32 || payload.length < offset + 32) {
+      throw new Error('Malformed structured auth request: invalid nextCommitment length');
+    }
+    const nextCommitment = Buffer.from(payload.subarray(offset, offset + 32));
+
+    return {
+      type: AuthType.StagedReauth,
+      nodeID,
+      validator,
+      nextCommitment,
+    };
+  }
+
+  if (payload.length < offset + 2) {
+    throw new Error('Malformed structured auth request: missing credential length');
+  }
+  const credLen = payload.readUInt16LE(offset);
+  offset += 2;
+  if (payload.length < offset + credLen) {
+    throw new Error('Malformed structured auth request: truncated credential');
+  }
+  const credential = payload.toString('utf-8', offset, offset + credLen);
+  offset += credLen;
+
+  const req: AuthRequest = {
+    type: authType,
+    nodeID,
+    credential,
+  };
+
+  if (payload.length >= offset + 2 + 32) {
+    const commLen = payload.readUInt16LE(offset);
+    if (commLen === 32) {
+      offset += 2;
+      req.initialCommitment = Buffer.from(payload.subarray(offset, offset + 32));
+      req.hasCommitment = true;
+    }
+  }
+
+  return req;
+}
+
+/**
+ * Encodes an issued session key into an OpResponseOK payload.
+ */
+export function encodeAuthResponse(sessionKey: string): Buffer {
+  const keyBytes = Buffer.from(sessionKey, 'utf-8');
+  const keyLen = Math.min(keyBytes.length, 0xffff);
+  const buf = Buffer.alloc(1 + 2 + keyLen);
+  buf[0] = StructuredRespMagic;
+  buf.writeUInt16LE(keyLen, 1);
+  keyBytes.copy(buf, 3, 0, keyLen);
+  return buf;
+}
+
+/**
+ * Decodes an issued session key from a structured OpResponseOK payload.
+ */
+export function decodeAuthResponse(payload: Buffer): string {
+  if (payload.length < 3) {
+    throw new Error('Malformed structured auth response: truncated');
+  }
+  if (payload[0] !== StructuredRespMagic) {
+    throw new Error('Auth response is not a structured session response');
+  }
+  const keyLen = payload.readUInt16LE(1);
+  if (payload.length < 3 + keyLen) {
+    throw new Error('Malformed structured auth response: truncated key bytes');
+  }
+  return payload.toString('utf-8', 3, 3 + keyLen);
+}
+
+/**
+ * Encodes an OpResponseOK payload carrying SubCodeRotationStaged.
+ */
+export function encodeRotationStagedResponse(msg: string): Buffer {
+  const msgBytes = Buffer.from(msg, 'utf-8');
+  const msgLen = Math.min(msgBytes.length, 0xffff);
+  const buf = Buffer.alloc(1 + 1 + 2 + msgLen);
+  buf[0] = StructuredRespMagic;
+  buf[1] = SubCodeRotationStaged;
+  buf.writeUInt16LE(msgLen, 2);
+  msgBytes.copy(buf, 4, 0, msgLen);
+  return buf;
+}
+
+/**
+ * Decodes an OpResponseOK payload carrying SubCodeRotationStaged.
+ */
+export function decodeRotationStagedResponse(payload: Buffer): { subCode: number; message: string } {
+  if (payload.length < 4) {
+    throw new Error('Malformed structured rotation response: truncated');
+  }
+  if (payload[0] !== StructuredRespMagic) {
+    throw new Error('Auth response is not a structured response');
+  }
+  const subCode = payload[1];
+  const msgLen = payload.readUInt16LE(2);
+  if (payload.length < 4 + msgLen) {
+    throw new Error('Malformed structured rotation response: truncated message bytes');
+  }
+  return { subCode, message: payload.toString('utf-8', 4, 4 + msgLen) };
+}
+
+/**
+ * Encodes client workload estimation for OpCode.NegotiateMemory.
+ */
+export function encodeMemoryNegotiationRequest(req: MemoryNegotiationRequest): Buffer {
+  const buf = Buffer.alloc(12);
+  buf.writeUInt32LE(req.targetRecords >>> 0, 0);
+  buf.writeUInt32LE(req.estimatedRecordSizeBytes >>> 0, 4);
+  buf.writeUInt32LE(req.clientBatchSize >>> 0, 8);
+  return buf;
+}
+
+/**
+ * Decodes client workload estimation from OpCode.NegotiateMemory request.
+ */
+export function decodeMemoryNegotiationRequest(data: Buffer): MemoryNegotiationRequest {
+  if (data.length < 12) {
+    throw new Error('Truncated memory negotiation request');
+  }
+  return {
+    targetRecords: data.readUInt32LE(0),
+    estimatedRecordSizeBytes: data.readUInt32LE(4),
+    clientBatchSize: data.readUInt32LE(8),
+  };
+}
+
+/**
+ * Encodes server pacing strategy for OpCode.NegotiateMemory response.
+ */
+export function encodeMemoryNegotiationResponse(resp: MemoryNegotiationResponse): Buffer {
+  const buf = Buffer.alloc(18);
+  buf[0] = resp.status;
+  buf[1] = resp.hostUsedPct;
+  buf.writeBigUInt64LE(resp.headroomBytes, 2);
+  buf.writeUInt32LE(resp.allocatedBatchSize >>> 0, 10);
+  buf.writeUInt32LE(resp.releaseIntervalMs >>> 0, 14);
+  return buf;
+}
+
+/**
+ * Decodes server pacing strategy from OpCode.NegotiateMemory response.
+ */
+export function decodeMemoryNegotiationResponse(data: Buffer): MemoryNegotiationResponse {
+  if (data.length < 18) {
+    throw new Error('Truncated memory negotiation response');
+  }
+  return {
+    status: data[0],
+    hostUsedPct: data[1],
+    headroomBytes: data.readBigUInt64LE(2),
+    allocatedBatchSize: data.readUInt32LE(10),
+    releaseIntervalMs: data.readUInt32LE(14),
+  };
 }
 
 /**
@@ -359,11 +639,8 @@ export function decodeGetResultPayload(data: Buffer, name: string, flags: number
     offset += 4;
   }
 
-  const result: EntityResult = { name, operation, props };
-  if ((flags & Flags.ColdTier) !== 0) {
-    result.isColdTier = true;
-  }
-  return result;
+  const isColdTier = (flags & Flags.ColdTier) !== 0;
+  return new EntityResult(name, operation, props, isColdTier);
 }
 
 /**
@@ -545,7 +822,7 @@ export function decodeListResponse(data: Buffer): ListResult {
       offset += 4;
     }
 
-    items.push({ name, operation, props });
+    items.push(new EntityResult(name, operation, props));
   }
 
   return { totalCount, hasMore, items };
@@ -866,12 +1143,29 @@ export function decodeErrorPayload(data: Buffer): { code: number; message: strin
 
 // --- FILTER & COMPUTE HELPERS ------------------------------------------------
 
+function parseFilterValueToFloat(v: number | string): number {
+  if (typeof v === 'number') {
+    return v;
+  }
+  const str = v.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+    return parseDate(str);
+  }
+  const parsed = Number.parseFloat(str);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`cannot convert filter value "${v}" to float32`);
+  }
+  return parsed;
+}
+
 function appendFilterCondition(chunks: Buffer[], f: FilterCondition): void {
   appendString(chunks, f.field);
   appendString(chunks, f.operator);
+  const val = parseFilterValueToFloat(f.value);
+  const valHigh = f.valueHigh !== undefined ? parseFilterValueToFloat(f.valueHigh) : 0;
   const vBuf = Buffer.allocUnsafe(8);
-  vBuf.writeFloatLE(f.value, 0);
-  vBuf.writeFloatLE(f.valueHigh ?? 0, 4);
+  vBuf.writeFloatLE(val, 0);
+  vBuf.writeFloatLE(valHigh, 4);
   chunks.push(vBuf);
 }
 

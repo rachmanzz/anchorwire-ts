@@ -69,9 +69,55 @@ export const OpStatus = {
 export type OpStatusType = (typeof OpStatus)[keyof typeof OpStatus];
 
 export const OrderByMode = {
-  Score: 0,
+  Composite: 0,
+  CompositeDesc: 0,
   AxisDistance: 1,
-  Composite: 2,
+  Distance: 1,
+  DistanceAsc: 1,
+  Score: 2,
+  ScoreDesc: 2,
 } as const;
 
 export type OrderByModeType = (typeof OrderByMode)[keyof typeof OrderByMode];
+
+// Structured Authentication
+export const StructuredAuthMagic = 0xAA;
+export const StructuredRespMagic = 0xAB;
+export const SubCodeRotationStaged = 0x01;
+
+export const AuthType = {
+  Pairing: 0x01,
+  OTK: 0x02,
+  Session: 0x03,
+  Static: 0x04,
+  StagedReauth: 0x05,
+} as const;
+
+export type AuthTypeKey = (typeof AuthType)[keyof typeof AuthType];
+
+export const AuthErrorCode = {
+  PairingClosed: 1001,
+  IPNotAllowed: 1002,
+  OTKExpiredOrBurned: 1003,
+  InvalidSession: 1004,
+  Unauthorized: 1005,
+  MalformedPayload: 1006,
+} as const;
+
+export type AuthErrorCodeKey = (typeof AuthErrorCode)[keyof typeof AuthErrorCode];
+
+// Memory Admission Status
+export const MemoryStatus = {
+  Granted: 0,
+  Throttled: 1,
+  Hold: 2,
+} as const;
+
+export type MemoryStatusType = (typeof MemoryStatus)[keyof typeof MemoryStatus];
+
+// Schema Error Constants (matching Go storage & driver)
+export const ErrSchemaMismatch = 'schema mismatch: incoming schema does not match registered model contract';
+export const ErrSchemaLocked = 'model schema is locked and cannot be modified';
+export const ErrMissingRequiredField = 'missing required field';
+export const ErrUnknownField = 'unknown field not defined in schema';
+export const ErrInvalidFieldType = 'invalid field type';

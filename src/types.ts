@@ -14,6 +14,25 @@ export interface Point2D {
 export type Roles = [number, number, number, number];
 
 /**
+ * Supported scalar field type specifications in AnchorDB ModelSchema.
+ * Append '?' to mark a field as optional (e.g. 'float?', 'int?', 'bool?', 'date?').
+ */
+export type SchemaFieldType =
+  | 'int'
+  | 'int?'
+  | 'float'
+  | 'float?'
+  | 'bool'
+  | 'bool?'
+  | 'date'
+  | 'date?';
+
+/**
+ * Mapping of field names to their AnchorDB type specification (e.g. { amount: 'float', discount: 'float?' }).
+ */
+export type ModelSchema = Record<string, SchemaFieldType | string>;
+
+/**
  * Entity record payload for saving or batch ingestion.
  */
 export interface RecordItem {
@@ -24,15 +43,8 @@ export interface RecordItem {
   roles?: Roles;
 }
 
-/**
- * Retrieved entity record from AnchorDB.
- */
-export interface EntityResult {
-  name: string;
-  operation: number;
-  props: Record<string, number>;
-  isColdTier?: boolean;
-}
+import { EntityResult } from './entity.js';
+export { EntityResult };
 
 /**
  * In-storage calculation / mutation descriptor.
@@ -48,13 +60,23 @@ export type ComputeOp =
   | { type: 'assign'; value: string };
 
 /**
+ * Expression descriptor for in-storage calculations (AnchorDB Go driver parity alias for ComputeOp).
+ */
+export type OperatorExpr = ComputeOp;
+
+/**
+ * Filter value supporting numeric float32 values or ISO date strings.
+ */
+export type FilterValue = number | string;
+
+/**
  * Predicate filter condition for List and Update queries.
  */
 export interface FilterCondition {
   field: string;
   operator: string;
-  value: number;
-  valueHigh?: number;
+  value: FilterValue;
+  valueHigh?: FilterValue;
 }
 
 /**
@@ -129,6 +151,11 @@ export interface GraphChainOptions {
 }
 
 /**
+ * In-storage geometric and statistical operator names.
+ */
+export type MathOperator = 'distance' | 'centroid' | 'cosine_similarity' | 'nearest';
+
+/**
  * Response from an in-storage geometric Math operation.
  */
 export interface MathResponse {
@@ -195,6 +222,39 @@ export interface Frame {
 }
 
 /**
+ * Structured authentication request for node joining, pairing, or session validation.
+ */
+export interface AuthRequest {
+  type: number;
+  nodeID: string;
+  credential?: string;
+  validator?: Uint8Array | Buffer;
+  nextCommitment?: Uint8Array | Buffer;
+  initialCommitment?: Uint8Array | Buffer;
+  hasCommitment?: boolean;
+}
+
+/**
+ * Client workload estimation for OpCode.NegotiateMemory.
+ */
+export interface MemoryNegotiationRequest {
+  targetRecords: number;
+  estimatedRecordSizeBytes: number;
+  clientBatchSize: number;
+}
+
+/**
+ * Server pacing and admission response for OpCode.NegotiateMemory.
+ */
+export interface MemoryNegotiationResponse {
+  status: number;
+  hostUsedPct: number;
+  headroomBytes: bigint;
+  allocatedBatchSize: number;
+  releaseIntervalMs: number;
+}
+
+/**
  * Connection options for the AnchorWire client.
  */
 export interface WireClientOptions {
@@ -204,4 +264,18 @@ export interface WireClientOptions {
   model?: string;
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
+  enableAdaptivePacing?: boolean;
+  targetRecords?: number;
+  schema?: ModelSchema | string;
+  poolSize?: number;
 }
+
+/**
+ * Metadata for registered cold partition archives (alias matching Go driver.PartitionMeta).
+ */
+export type PartitionMeta = PartitionCatalogItem;
+
+/**
+ * Inspection result from an archived partition (alias matching Go driver.PartitionInspectResult).
+ */
+export type PartitionInspectResult = PartitionInspectResponse;

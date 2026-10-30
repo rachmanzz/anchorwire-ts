@@ -28,4 +28,4 @@ jobs:
         run: npm run build
 
       - name: Run Unit Tests
-        run: node --test --import tsx tests/protocol.test.ts
+        run: npm test

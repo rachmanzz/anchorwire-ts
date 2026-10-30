@@ -1,7 +1,15 @@
 import * as net from 'node:net';
-import { MAGIC, VERSION, OpCode, Flags } from './constants.js';
-import { encodeFrame, decodeFrame, encodeAuthPayload, encodeSelectModelPayload, decodeErrorPayload } from './protocol.js';
-import { Frame, WireClientOptions } from './types.js';
+import { MAGIC, VERSION, OpCode, Flags, MemoryStatus } from './constants.js';
+import {
+  encodeFrame,
+  decodeFrame,
+  encodeAuthPayload,
+  encodeSelectModelPayload,
+  decodeErrorPayload,
+  encodeMemoryNegotiationRequest,
+  decodeMemoryNegotiationResponse,
+} from './protocol.js';
+import { Frame, WireClientOptions, MemoryNegotiationResponse } from './types.js';
 
 interface PendingRequest {
   resolve: (frame: Frame) => void;
@@ -28,6 +36,10 @@ export class WireConnection {
   private connectPromise: Promise<void> | null = null;
   private modelSwitchQueue: Promise<void> = Promise.resolve();
 
+  private negotiation: MemoryNegotiationResponse | null = null;
+  private pacingEnabled = false;
+  private targetRecords = 1000;
+
   constructor(options: WireClientOptions = {}) {
     this.host = options.host ?? '127.0.0.1';
     this.port = options.port ?? 7448;
@@ -35,6 +47,8 @@ export class WireConnection {
     this.model = options.model ?? 'default';
     this.connectTimeoutMs = options.connectTimeoutMs ?? 5000;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10000;
+    this.pacingEnabled = options.enableAdaptivePacing ?? false;
+    this.targetRecords = options.targetRecords ?? 1000;
   }
 
   /**
@@ -70,6 +84,19 @@ export class WireConnection {
           if (resp.opCode === OpCode.ResponseError) {
             const err = decodeErrorPayload(resp.payload);
             throw new Error(`Select model failed (${err.code}): ${err.message}`);
+          }
+        }
+
+        // 3. Negotiate initial memory pacing if enabled
+        if (this.pacingEnabled) {
+          const negoPayload = encodeMemoryNegotiationRequest({
+            targetRecords: this.targetRecords,
+            estimatedRecordSizeBytes: 512,
+            clientBatchSize: 1000,
+          });
+          const resp = await this.sendRaw(OpCode.NegotiateMemory, negoPayload, Flags.None);
+          if (resp.opCode === OpCode.ResponseOK) {
+            this.negotiation = decodeMemoryNegotiationResponse(resp.payload);
           }
         }
 
@@ -155,6 +182,7 @@ export class WireConnection {
         this.dispatchFrame(decoded.frame);
       } catch (err) {
         this.buffer = Buffer.alloc(0);
+        this.cleanupSocket();
         this.onError(err instanceof Error ? err : new Error(String(err)));
         break;
       }
@@ -162,6 +190,24 @@ export class WireConnection {
   }
 
   private dispatchFrame(frame: Frame): void {
+    if ((frame.flags & Flags.MemoryPressure) !== 0) {
+      if (!this.negotiation) {
+        this.negotiation = {
+          status: MemoryStatus.Hold,
+          hostUsedPct: 85,
+          headroomBytes: 0n,
+          allocatedBatchSize: 500,
+          releaseIntervalMs: 10,
+        };
+      } else {
+        this.negotiation.status = MemoryStatus.Hold;
+      }
+    } else if (this.negotiation && this.negotiation.status === MemoryStatus.Hold) {
+      this.negotiation.status = MemoryStatus.Granted;
+      this.negotiation.allocatedBatchSize = 1000;
+      this.negotiation.releaseIntervalMs = 0;
+    }
+
     const p = this.pending.get(frame.seq);
     if (p) {
       clearTimeout(p.timer);
@@ -268,7 +314,7 @@ export class WireConnection {
       await this.connect();
     }
 
-    if (targetModel && targetModel !== this.model && opCode !== OpCode.Auth && opCode !== OpCode.SelectModel) {
+    if (targetModel && opCode !== OpCode.Auth && opCode !== OpCode.SelectModel) {
       await this.setModel(targetModel);
     }
 
@@ -302,6 +348,34 @@ export class WireConnection {
       () => undefined,
     );
     return next;
+  }
+
+  /**
+   * Returns the current memory negotiation status, if negotiated.
+   */
+  public getNegotiation(): MemoryNegotiationResponse | null {
+    return this.negotiation ? { ...this.negotiation } : null;
+  }
+
+  /**
+   * Sets or overrides the active memory negotiation parameters.
+   */
+  public setNegotiation(nego: MemoryNegotiationResponse | null): void {
+    this.negotiation = nego ? { ...nego } : null;
+  }
+
+  /**
+   * Enables or disables adaptive batch pacing.
+   */
+  public enableAdaptivePacing(enabled: boolean): void {
+    this.pacingEnabled = enabled;
+  }
+
+  /**
+   * Reports whether adaptive batch pacing is enabled.
+   */
+  public isPacingEnabled(): boolean {
+    return this.pacingEnabled;
   }
 
   /**

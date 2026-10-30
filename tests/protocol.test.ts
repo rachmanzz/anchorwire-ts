@@ -8,6 +8,9 @@ import {
   Flags,
   OpStatus,
   OrderByMode,
+  AuthType,
+  AuthErrorCode,
+  MemoryStatus,
   crc32IEEE,
   appendString,
   readString,
@@ -40,6 +43,16 @@ import {
   decodePartitionCatalogResponse,
   encodePartitionInspectRequest,
   decodePartitionInspectResponse,
+  encodeStructuredAuth,
+  decodeStructuredAuth,
+  encodeAuthResponse,
+  decodeAuthResponse,
+  encodeRotationStagedResponse,
+  decodeRotationStagedResponse,
+  encodeMemoryNegotiationRequest,
+  decodeMemoryNegotiationRequest,
+  encodeMemoryNegotiationResponse,
+  decodeMemoryNegotiationResponse,
   encodeOKPayload,
   decodeOKPayload,
   encodeErrorPayload,
@@ -237,7 +250,11 @@ describe('AnchorWire Protocol & Codecs', () => {
       operationFilter: OpStatus.Active,
       allowedOperations: [OpStatus.Active, OpStatus.Archived],
       select: ['severity'],
-      filters: [{ field: 'severity', operator: '>=', value: 3.0 }],
+      filters: [
+        { field: 'severity', operator: '>=', value: 3.0 },
+        { field: 'price', operator: '<=', value: '150.5' },
+        { field: 'created', operator: '==', value: '2026-10-14' },
+      ],
       computations: { double_sev: { type: 'multiply', fieldA: 'severity', fieldB: 'severity' } },
     });
     assert.ok(reqBuf.length > 20);
@@ -383,6 +400,85 @@ describe('AnchorWire Protocol & Codecs', () => {
     assert.equal(err.message, 'entity not found');
   });
 
+  test('Structured Auth codecs (Pairing, OTK, Session, StagedReauth, InitialCommitment)', () => {
+    // 1. Pairing with initial commitment
+    const comm = Buffer.alloc(32, 0x7a);
+    const pairingBuf = encodeStructuredAuth({
+      type: AuthType.Pairing,
+      nodeID: 'edge-gateway-1',
+      initialCommitment: comm,
+      hasCommitment: true,
+    });
+    const pairingReq = decodeStructuredAuth(pairingBuf);
+    assert.equal(pairingReq.type, AuthType.Pairing);
+    assert.equal(pairingReq.nodeID, 'edge-gateway-1');
+    assert.equal(pairingReq.hasCommitment, true);
+    assert.deepEqual(pairingReq.initialCommitment, comm);
+
+    // 2. OTK join request
+    const otkBuf = encodeStructuredAuth({
+      type: AuthType.OTK,
+      nodeID: 'connector-node-2',
+      credential: 'ANCH.JOIN.CONNECTOR.c1.10.random.sig',
+    });
+    const otkReq = decodeStructuredAuth(otkBuf);
+    assert.equal(otkReq.type, AuthType.OTK);
+    assert.equal(otkReq.nodeID, 'connector-node-2');
+    assert.equal(otkReq.credential, 'ANCH.JOIN.CONNECTOR.c1.10.random.sig');
+
+    // 3. Staged Reauth with validator preimage and next commitment
+    const validator = Buffer.alloc(32, 0x11);
+    const nextComm = Buffer.alloc(32, 0x22);
+    const reauthBuf = encodeStructuredAuth({
+      type: AuthType.StagedReauth,
+      nodeID: 'connector-node-2',
+      validator,
+      nextCommitment: nextComm,
+    });
+    const reauthReq = decodeStructuredAuth(reauthBuf);
+    assert.equal(reauthReq.type, AuthType.StagedReauth);
+    assert.equal(reauthReq.nodeID, 'connector-node-2');
+    assert.deepEqual(reauthReq.validator, validator);
+    assert.deepEqual(reauthReq.nextCommitment, nextComm);
+
+    // 4. Auth response (Session key)
+    const sessionKey = 'SESS.c1.connector-node-2.abcdef123456';
+    const sessBuf = encodeAuthResponse(sessionKey);
+    assert.equal(decodeAuthResponse(sessBuf), sessionKey);
+
+    // 5. Rotation staged response
+    const stageMsg = 'Commitment staged successfully';
+    const stageBuf = encodeRotationStagedResponse(stageMsg);
+    const decodedStage = decodeRotationStagedResponse(stageBuf);
+    assert.equal(decodedStage.message, stageMsg);
+  });
+
+  test('Memory Negotiation request and response codecs', () => {
+    const reqBuf = encodeMemoryNegotiationRequest({
+      targetRecords: 50000,
+      estimatedRecordSizeBytes: 256,
+      clientBatchSize: 1500,
+    });
+    const req = decodeMemoryNegotiationRequest(reqBuf);
+    assert.equal(req.targetRecords, 50000);
+    assert.equal(req.estimatedRecordSizeBytes, 256);
+    assert.equal(req.clientBatchSize, 1500);
+
+    const respBuf = encodeMemoryNegotiationResponse({
+      status: MemoryStatus.Throttled,
+      hostUsedPct: 78,
+      headroomBytes: 1048576000n,
+      allocatedBatchSize: 1000,
+      releaseIntervalMs: 5,
+    });
+    const resp = decodeMemoryNegotiationResponse(respBuf);
+    assert.equal(resp.status, MemoryStatus.Throttled);
+    assert.equal(resp.hostUsedPct, 78);
+    assert.equal(resp.headroomBytes, 1048576000n);
+    assert.equal(resp.allocatedBatchSize, 1000);
+    assert.equal(resp.releaseIntervalMs, 5);
+  });
+
   test('parseWireUrl handles IPv4, IPv6, and query parameters', () => {
     const opts1 = parseWireUrl('wire://10.0.0.5:7448?token=abc&model=fraud');
     assert.equal(opts1.host, '10.0.0.5');
@@ -469,6 +565,49 @@ describe('WireConnection & Client Socket Lifecycle (Mock TCP Server)', () => {
               payload: encodeOKPayload('pong'),
             });
             socket.write(resp);
+          } else if (frame.opCode === OpCode.AttachSchema) {
+            const schemaStr = decodeGetSchemaPayload(frame.payload);
+            const parsed = JSON.parse(schemaStr) as Record<string, string>;
+            assert.equal(parsed.amount, 'float');
+            assert.equal(parsed.discount, 'float?');
+            const resp = encodeFrame({
+              magic: MAGIC,
+              version: VERSION,
+              opCode: OpCode.ResponseOK,
+              flags: Flags.None,
+              seq: frame.seq,
+              payload: encodeOKPayload('schema attached'),
+            });
+            socket.write(resp);
+          } else if (frame.opCode === OpCode.NegotiateMemory) {
+            const req = decodeMemoryNegotiationRequest(frame.payload);
+            assert.equal(req.targetRecords, 1000);
+            const resp = encodeFrame({
+              magic: MAGIC,
+              version: VERSION,
+              opCode: OpCode.ResponseOK,
+              flags: Flags.MemoryPressure,
+              seq: frame.seq,
+              payload: encodeMemoryNegotiationResponse({
+                status: MemoryStatus.Hold,
+                hostUsedPct: 90,
+                headroomBytes: 500000n,
+                allocatedBatchSize: 100,
+                releaseIntervalMs: 5,
+              }),
+            });
+            socket.write(resp);
+          } else if (frame.opCode === OpCode.SaveBatch) {
+            const items = decodeSaveBatchPayload(frame.payload);
+            const resp = encodeFrame({
+              magic: MAGIC,
+              version: VERSION,
+              opCode: OpCode.ResponseOK,
+              flags: Flags.None,
+              seq: frame.seq,
+              payload: encodeOKPayload(String(items.length)),
+            });
+            socket.write(resp);
           }
         }
       });
@@ -480,6 +619,20 @@ describe('WireConnection & Client Socket Lifecycle (Mock TCP Server)', () => {
     try {
       const client = await connectWire(`wire://127.0.0.1:${addr.port}?token=tok1&model=model_alpha`);
       await client.ping();
+      await client.attachSchema({ amount: 'float', discount: 'float?' });
+
+      // Negotiate memory pacing and verify
+      const nego = await client.negotiateMemory(1000);
+      assert.equal(nego.status, MemoryStatus.Hold);
+      assert.equal(client.getNegotiation()?.status, MemoryStatus.Hold);
+
+      client.enableAdaptivePacing(true);
+      const batchSaved = await client.saveBatch([
+        { name: 'rec_1', props: { amount: 100 } },
+        { name: 'rec_2', props: { amount: 200 } },
+      ]);
+      assert.equal(batchSaved.length, 2);
+      assert.deepEqual(batchSaved, ['rec_1', 'rec_2']);
 
       // Switch models via scoped client.model()
       const modelBeta = client.model('model_beta');
