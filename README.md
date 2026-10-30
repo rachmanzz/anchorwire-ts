@@ -1,4 +1,4 @@
-# @anchordb/wire
+# @rahmantech/anchorwire
 
 Official high-performance TypeScript and Node.js client for **AnchorDB** using the native binary **AnchorWire** protocol (`wire://` over TCP port `7448`).
 
@@ -21,11 +21,11 @@ Official high-performance TypeScript and Node.js client for **AnchorDB** using t
 ## Installation
 
 ```bash
-npm install @anchordb/wire
+npm install @rahmantech/anchorwire
 # or
-pnpm add @anchordb/wire
+pnpm add @rahmantech/anchorwire
 # or
-bun add @anchordb/wire
+bun add @rahmantech/anchorwire
 ```
 
 ---
@@ -33,7 +33,7 @@ bun add @anchordb/wire
 ## Quick Start
 
 ```typescript
-import { connectWire } from '@anchordb/wire';
+import { connectWire } from '@rahmantech/anchorwire';
 
 async function main() {
   // Connect to AnchorWire server (default: 127.0.0.1:7448)

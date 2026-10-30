@@ -1,5 +1,5 @@
 {
-  "name": "@anchordb/wire",
+  "name": "@rahmantech/anchorwire",
   "version": "0.1.0",
   "description": "Official TypeScript & Node.js client for AnchorDB AnchorWire binary protocol",
   "type": "module",
