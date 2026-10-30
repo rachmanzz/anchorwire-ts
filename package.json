@@ -1,0 +1,45 @@
+{
+  "name": "@anchordb/wire",
+  "version": "0.1.0",
+  "description": "Official TypeScript & Node.js client for AnchorDB AnchorWire binary protocol",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test --import tsx tests/**/*.test.ts"
+  },
+  "keywords": [
+    "anchordb",
+    "database",
+    "wire",
+    "binary",
+    "spatial",
+    "causal",
+    "graph"
+  ],
+  "author": "Muhammad Abdurrahman <rachmanzz.ak@gmail.com>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rachmanzz/anchorwire-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rachmanzz/anchorwire-ts/issues"
+  },
+  "homepage": "https://github.com/rachmanzz/anchorwire-ts#readme",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
