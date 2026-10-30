@@ -57,6 +57,8 @@ export const Flags = {
   EpochFenced: 0x40,
 } as const;
 
+export type FlagsType = (typeof Flags)[keyof typeof Flags];
+
 export const OpStatus = {
   SafeDelete: 0,
   Active: 1,
@@ -64,8 +66,12 @@ export const OpStatus = {
   Retry: 3,
 } as const;
 
+export type OpStatusType = (typeof OpStatus)[keyof typeof OpStatus];
+
 export const OrderByMode = {
   Score: 0,
   AxisDistance: 1,
   Composite: 2,
 } as const;
+
+export type OrderByModeType = (typeof OrderByMode)[keyof typeof OrderByMode];
